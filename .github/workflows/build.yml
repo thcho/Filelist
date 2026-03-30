@@ -1,0 +1,32 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches: [ "claude/file-metadata-printer-RXKR7", "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build executable
+        run: pyinstaller --onefile --name filelist filelist.py
+
+      - name: Test executable
+        run: .\dist\filelist.exe $env:SystemRoot\System32 | Select-Object -First 20
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: filelist-windows
+          path: dist/filelist.exe
