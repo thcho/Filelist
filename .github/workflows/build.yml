@@ -23,7 +23,8 @@ jobs:
         run: pyinstaller --onefile --name filelist filelist.py
 
       - name: Test executable
-        run: .\dist\filelist.exe $env:SystemRoot\System32 | Select-Object -First 20
+        run: .\dist\filelist.exe .
+        shell: cmd
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

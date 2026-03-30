@@ -223,6 +223,12 @@ def list_files(folder: str, recursive: bool = False, output_file: str | None = N
 
 
 def main():
+    # Windows 콘솔 인코딩 문제 방지
+    if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(
         description="특정 폴더에 있는 파일들의 버전, 크기, 만든 날짜를 텍스트로 출력합니다."
     )
