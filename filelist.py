@@ -32,130 +32,87 @@ def get_creation_date(filepath: str) -> str:
     return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def get_file_version_pe(filepath: str) -> str | None:
-    """PE 파일(exe, dll)에서 파일 버전 정보를 추출 (순수 Python, 외부 라이브러리 불필요)."""
+def _get_version_win32(filepath: str) -> str | None:
+    """Windows API(version.dll)를 사용하여 파일 버전을 추출."""
+    import ctypes
+    from ctypes import wintypes
+
+    version_dll = ctypes.windll.version
+    kernel32 = ctypes.windll.kernel32
+
+    # GetFileVersionInfoSizeW
+    size = version_dll.GetFileVersionInfoSizeW(filepath, None)
+    if not size:
+        return None
+
+    # GetFileVersionInfoW
+    buf = ctypes.create_string_buffer(size)
+    if not version_dll.GetFileVersionInfoW(filepath, 0, size, buf):
+        return None
+
+    # VerQueryValueW - VS_FIXEDFILEINFO 구조체 가져오기
+    pval = ctypes.c_void_p()
+    ulen = wintypes.UINT()
+    if not version_dll.VerQueryValueW(buf, "\\", ctypes.byref(pval), ctypes.byref(ulen)):
+        return None
+
+    if ulen.value == 0:
+        return None
+
+    # VS_FIXEDFILEINFO 구조체에서 버전 읽기
+    class VS_FIXEDFILEINFO(ctypes.Structure):
+        _fields_ = [
+            ("dwSignature", wintypes.DWORD),
+            ("dwStrucVersion", wintypes.DWORD),
+            ("dwFileVersionMS", wintypes.DWORD),
+            ("dwFileVersionLS", wintypes.DWORD),
+            ("dwProductVersionMS", wintypes.DWORD),
+            ("dwProductVersionLS", wintypes.DWORD),
+        ]
+
+    info = ctypes.cast(pval, ctypes.POINTER(VS_FIXEDFILEINFO)).contents
+    if info.dwSignature != 0xFEEF04BD:
+        return None
+
+    major = (info.dwFileVersionMS >> 16) & 0xFFFF
+    minor = info.dwFileVersionMS & 0xFFFF
+    build = (info.dwFileVersionLS >> 16) & 0xFFFF
+    patch = info.dwFileVersionLS & 0xFFFF
+    return f"{major}.{minor}.{build}.{patch}"
+
+
+def _get_version_binary(filepath: str) -> str | None:
+    """PE 파일에서 VS_FIXEDFILEINFO 시그니처를 직접 검색하여 버전 추출 (비Windows 폴백)."""
     try:
         with open(filepath, "rb") as f:
             # MZ 헤더 확인
             if f.read(2) != b"MZ":
                 return None
-            f.seek(0x3C)
-            pe_offset = struct.unpack("<I", f.read(4))[0]
-            f.seek(pe_offset)
-            if f.read(4) != b"PE\x00\x00":
-                return None
+            # 파일 전체를 읽어서 시그니처 검색 (최대 10MB)
+            f.seek(0)
+            data = f.read(10 * 1024 * 1024)
 
-            # COFF 헤더
-            f.read(2)  # Machine
-            num_sections = struct.unpack("<H", f.read(2))[0]
-            f.read(12)  # TimeDateStamp, PointerToSymbolTable, NumberOfSymbols
-            size_of_optional = struct.unpack("<H", f.read(2))[0]
-            f.read(2)  # Characteristics
+        sig = struct.pack("<I", 0xFEEF04BD)
+        idx = data.find(sig)
+        if idx == -1:
+            return None
 
-            if size_of_optional == 0:
-                return None
+        fixed = data[idx : idx + 52]
+        if len(fixed) < 52:
+            return None
 
-            optional_start = f.tell()
-            magic = struct.unpack("<H", f.read(2))[0]
-            is_pe32_plus = magic == 0x20B
+        # dwStrucVersion 검증 (보통 0x00010000)
+        struc_ver = struct.unpack("<I", fixed[4:8])[0]
+        if struc_ver == 0:
+            return None
 
-            # Resource directory RVA 가져오기
-            if is_pe32_plus:
-                f.seek(optional_start + 136)
-            else:
-                f.seek(optional_start + 120)
-            resource_rva = struct.unpack("<I", f.read(4))[0]
-            f.read(4)  # resource size
-
-            if resource_rva == 0:
-                return None
-
-            # 섹션 헤더에서 .rsrc 찾기
-            f.seek(optional_start + size_of_optional)
-            rsrc_offset = None
-            for _ in range(num_sections):
-                section_data = f.read(40)
-                name = section_data[:8].rstrip(b"\x00")
-                virtual_addr = struct.unpack("<I", section_data[12:16])[0]
-                raw_size = struct.unpack("<I", section_data[16:20])[0]
-                raw_offset = struct.unpack("<I", section_data[20:24])[0]
-                if virtual_addr <= resource_rva < virtual_addr + raw_size:
-                    rsrc_offset = raw_offset + (resource_rva - virtual_addr)
-                    rsrc_base_rva = virtual_addr
-                    rsrc_base_raw = raw_offset
-                    break
-
-            if rsrc_offset is None:
-                return None
-
-            # VS_VERSION_INFO를 리소스에서 찾기
-            def rva_to_raw(rva):
-                return rsrc_base_raw + (rva - rsrc_base_rva)
-
-            # RT_VERSION (16) 리소스 탐색
-            f.seek(rsrc_offset + 12)
-            num_named = struct.unpack("<H", f.read(2))[0]
-            num_id = struct.unpack("<H", f.read(2))[0]
-
-            version_entry_offset = None
-            for _ in range(num_named + num_id):
-                entry_id = struct.unpack("<I", f.read(4))[0]
-                entry_offset = struct.unpack("<I", f.read(4))[0]
-                if entry_id == 16:  # RT_VERSION
-                    version_entry_offset = entry_offset & 0x7FFFFFFF
-                    break
-
-            if version_entry_offset is None:
-                return None
-
-            # 두 번째 레벨
-            f.seek(rsrc_offset + version_entry_offset + 12)
-            num_named = struct.unpack("<H", f.read(2))[0]
-            num_id = struct.unpack("<H", f.read(2))[0]
-            if num_named + num_id == 0:
-                return None
-            f.read(4)  # skip ID
-            entry_offset = struct.unpack("<I", f.read(4))[0]
-
-            # 세 번째 레벨
-            level3_offset = entry_offset & 0x7FFFFFFF
-            f.seek(rsrc_offset + level3_offset + 12)
-            num_named = struct.unpack("<H", f.read(2))[0]
-            num_id = struct.unpack("<H", f.read(2))[0]
-            if num_named + num_id == 0:
-                return None
-            f.read(4)  # skip ID
-            data_entry_offset = struct.unpack("<I", f.read(4))[0]
-
-            # 데이터 엔트리 (최상위 비트가 0이면 리프 노드)
-            if data_entry_offset & 0x80000000:
-                return None
-            f.seek(rsrc_offset + data_entry_offset)
-            data_rva = struct.unpack("<I", f.read(4))[0]
-            data_size = struct.unpack("<I", f.read(4))[0]
-
-            # VS_VERSIONINFO 데이터 읽기
-            raw_pos = rva_to_raw(data_rva)
-            f.seek(raw_pos)
-            version_data = f.read(min(data_size, 4096))
-
-            # VS_FIXEDFILEINFO 시그니처(0xFEEF04BD) 찾기
-            sig = struct.pack("<I", 0xFEEF04BD)
-            idx = version_data.find(sig)
-            if idx == -1:
-                return None
-
-            fixed = version_data[idx : idx + 52]
-            if len(fixed) < 52:
-                return None
-
-            file_ver_ms = struct.unpack("<I", fixed[8:12])[0]
-            file_ver_ls = struct.unpack("<I", fixed[12:16])[0]
-            major = (file_ver_ms >> 16) & 0xFFFF
-            minor = file_ver_ms & 0xFFFF
-            build = (file_ver_ls >> 16) & 0xFFFF
-            patch = file_ver_ls & 0xFFFF
-            return f"{major}.{minor}.{build}.{patch}"
+        file_ver_ms = struct.unpack("<I", fixed[8:12])[0]
+        file_ver_ls = struct.unpack("<I", fixed[12:16])[0]
+        major = (file_ver_ms >> 16) & 0xFFFF
+        minor = file_ver_ms & 0xFFFF
+        build = (file_ver_ls >> 16) & 0xFFFF
+        patch = file_ver_ls & 0xFFFF
+        return f"{major}.{minor}.{build}.{patch}"
     except Exception:
         return None
 
@@ -163,10 +120,23 @@ def get_file_version_pe(filepath: str) -> str | None:
 def get_file_version(filepath: str) -> str:
     """파일의 버전 정보를 반환."""
     ext = os.path.splitext(filepath)[1].lower()
-    if ext in (".exe", ".dll", ".sys", ".ocx", ".drv"):
-        version = get_file_version_pe(filepath)
-        if version:
-            return version
+    if ext not in (".exe", ".dll", ".sys", ".ocx", ".drv"):
+        return "N/A"
+
+    # Windows: version.dll API 사용 (가장 정확)
+    if platform.system() == "Windows":
+        try:
+            version = _get_version_win32(filepath)
+            if version:
+                return version
+        except Exception:
+            pass
+
+    # 폴백: 바이너리에서 시그니처 직접 검색
+    version = _get_version_binary(filepath)
+    if version:
+        return version
+
     return "N/A"
 
 
